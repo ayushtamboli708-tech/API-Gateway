@@ -3,6 +3,7 @@ from fastapi import Request, Response, HTTPException
 from fastapi.responses import JSONResponse
 
 # Registry for downstream microservices
+# (We will eventually move this to app/config.py as discussed)
 BACKEND_MAP = {
     "users": "http://localhost:9001",
     "orders": "http://localhost:9002",
@@ -17,9 +18,16 @@ EXCLUDED_HEADERS = {
     "connection"
 }
 
+# PHASE 3: Strict Timeouts
+# connect: max time to establish a socket connection (2s)
+# read: max time to wait for a chunk of data (3s)
+# write: max time to send data (2s)
+# pool: max time to wait for an available connection from the pool (2s)
+TIMEOUT = httpx.Timeout(connect=2.0, read=3.0, write=2.0, pool=2.0)
+
 async def forward_request(service: str, path: str, request: Request) -> Response:
     """
-    Takes an incoming request, strips the host header, injects the request ID,
+    Takes an incoming request, applies timeouts, injects tracing IDs,
     and proxies it to the designated backend service.
     """
     if service not in BACKEND_MAP:
@@ -34,7 +42,8 @@ async def forward_request(service: str, path: str, request: Request) -> Response
     if hasattr(request.state, "request_id"):
         headers["X-Request-ID"] = request.state.request_id
     
-    async with httpx.AsyncClient() as client:
+    # 3. Apply the strict TIMEOUT configuration to the HTTPX client
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         try:
             proxied = await client.request(
                 method=request.method,
@@ -43,10 +52,14 @@ async def forward_request(service: str, path: str, request: Request) -> Response
                 content=await request.body(),
                 params=request.query_params,
             )
+        except httpx.TimeoutException as e:
+            # Explicitly handle timeouts with a 504 status code
+            raise HTTPException(status_code=504, detail=f"Backend service timed out: {str(e)}")
         except httpx.RequestError as e:
+            # Handle other connection failures (e.g., connection refused)
             raise HTTPException(status_code=502, detail=f"Backend communication failed: {str(e)}")
 
-    # 3. Clean the response headers before handing them back to FastAPI
+    # 4. Clean the response headers before handing them back to FastAPI
     clean_headers = {
         k: v for k, v in proxied.headers.items() 
         if k.lower() not in EXCLUDED_HEADERS
