@@ -159,22 +159,41 @@ curl -i http://localhost:8000/api/v1/users/test \
 
 ## 🖼️ Screenshots
 
-### Architecture
-![Architecture](pictures\architecture.png)
+### 🏗️ Architecture
 
-### Locust Load Test
-![Locust Results](pictures\locus-stats.png)
-![Locust Charts](pictures\locus-charts.png)
+![Architecture](pictures/architecture.png)
 
-### Structured Logs
-**Usage log (successful request):**
-![Usage Log](pictures\successfull.png)
-![Usage Log](pictures\success-terminal.png)
+---
 
-**Audit log (blocked request — missing API key):**
-![Audit Log](pictures\unsuccessfull.png)
-![Audit Log](pictures\unsuccess-terminal.png)
+### 📈 Locust Load Test
 
+**Statistics**
+
+![Locust Results](pictures/locus-stats.png)
+
+**Performance Charts**
+
+![Locust Charts](pictures/locus-charts.png)
+
+---
+
+### ✅ Successful Request
+
+![Successful Request](pictures/successfull.png)
+
+**Structured Usage Log**
+
+![Usage Log](pictures/success-terminal.png)
+
+---
+
+### ❌ Unauthorized Request
+
+![Unauthorized Request](pictures/unsuccessfull.png)
+
+**Structured Audit Log**
+
+![Audit Log](pictures/unsuccess-terminal.png)
 ---
 
 ## ⚡ Performance
