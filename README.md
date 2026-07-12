@@ -268,4 +268,4 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ## 🙋 Author
 
-Built by [Your Name] to explore the core building blocks of modern API Gateways — authentication, multi-tenancy, traffic management, resiliency, and observability — using FastAPI, Redis, and HTTPX.
+Built by Ayush Tamboli to explore the core building blocks of modern API Gateways — authentication, multi-tenancy, traffic management, resiliency, and observability — using FastAPI, Redis, and HTTPX.
