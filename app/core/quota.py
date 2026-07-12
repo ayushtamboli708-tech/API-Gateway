@@ -22,8 +22,9 @@ async def check_quota(tenant: dict):
         
     # Block the request if the new total exceeds the assigned tier limit
     if current > int(tenant["monthly_quota"]):
+        # Distinct 403 status for hard billing/quota limits
         raise HTTPException(
-            status_code=429, 
+            status_code=403, 
             detail="Monthly API quota exceeded"
         )
         

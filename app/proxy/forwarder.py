@@ -25,6 +25,10 @@ EXCLUDED_HEADERS = {
 # pool: max time to wait for an available connection from the pool (2s)
 TIMEOUT = httpx.Timeout(connect=2.0, read=3.0, write=2.0, pool=2.0)
 
+# --- THE FIX: Initialize a single, global AsyncClient ---
+# This keeps TCP connections alive and reuses them across requests.
+proxy_client = httpx.AsyncClient(timeout=TIMEOUT)
+
 async def forward_request(service: str, path: str, request: Request) -> Response:
     """
     Takes an incoming request, applies timeouts, injects tracing IDs,
@@ -42,22 +46,21 @@ async def forward_request(service: str, path: str, request: Request) -> Response
     if hasattr(request.state, "request_id"):
         headers["X-Request-ID"] = request.state.request_id
     
-    # 3. Apply the strict TIMEOUT configuration to the HTTPX client
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        try:
-            proxied = await client.request(
-                method=request.method,
-                url=target_url,
-                headers=headers,
-                content=await request.body(),
-                params=request.query_params,
-            )
-        except httpx.TimeoutException as e:
-            # Explicitly handle timeouts with a 504 status code
-            raise HTTPException(status_code=504, detail=f"Backend service timed out: {str(e)}")
-        except httpx.RequestError as e:
-            # Handle other connection failures (e.g., connection refused)
-            raise HTTPException(status_code=502, detail=f"Backend communication failed: {str(e)}")
+    # 3. Apply the strict TIMEOUT configuration using the global HTTPX client
+    try:
+        proxied = await proxy_client.request(
+            method=request.method,
+            url=target_url,
+            headers=headers,
+            content=await request.body(),
+            params=request.query_params,
+        )
+    except httpx.TimeoutException as e:
+        # Explicitly handle timeouts with a 504 status code
+        raise HTTPException(status_code=504, detail=f"Backend service timed out: {str(e)}")
+    except httpx.RequestError as e:
+        # Handle other connection failures (e.g., connection refused)
+        raise HTTPException(status_code=502, detail=f"Backend communication failed: {str(e)}")
 
     # 4. Clean the response headers before handing them back to FastAPI
     clean_headers = {

@@ -6,7 +6,8 @@ async def authenticate_tenant(request: Request) -> dict:
     FastAPI Dependency: Extracts the API key from headers, verifies it against 
     Redis, and attaches the tenant metadata to the request state.
     """
-    api_key = request.headers.get("X-API-Key")
+    # Explicitly look for the lowercase header to avoid Starlette parsing quirks
+    api_key = request.headers.get("x-api-key")
     
     if not api_key:
         raise HTTPException(status_code=401, detail="Missing X-API-Key header")

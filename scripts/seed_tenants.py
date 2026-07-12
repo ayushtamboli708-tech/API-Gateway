@@ -10,7 +10,7 @@ async def seed():
         mapping={
             "tenant_id": "tenant_1",
             "plan": "pro",
-            "monthly_quota": 1000,
+            "monthly_quota": 10000,
             "rate_limit_per_min": 60,
         }
     )
