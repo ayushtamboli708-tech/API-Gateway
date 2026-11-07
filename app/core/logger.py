@@ -1,5 +1,5 @@
-import logging
 import json
+import logging
 from datetime import datetime, timezone
 
 # Initialize the logger
@@ -10,6 +10,9 @@ logger.setLevel(logging.INFO)
 if not logger.handlers:
     handler = logging.StreamHandler()
     logger.addHandler(handler)
+
+# Avoid double-emission through the root logger (e.g. uvicorn's handler).
+logger.propagate = False
 
 def log_event(event_type: str, **fields):
     """

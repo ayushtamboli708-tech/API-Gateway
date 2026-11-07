@@ -1,87 +1,243 @@
 import time
-from fastapi import FastAPI, Request, Depends, BackgroundTasks, HTTPException
-from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 
-# Phase 1: Middleware
-from app.middleware.request_id import RequestIDMiddleware
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-# Phase 2: Auth, Quotas, & Rate Limiting
 from app.auth.tenant_auth import authenticate_tenant
-from app.core.quota import check_quota
-from app.core.rate_limiter import check_rate_limit
-
-# Phase 3: Resilient Proxying
+from app.config import get_settings
+from app.core import metrics
+from app.core import redis_client as redis_store
+from app.core.background_logging import log_audit, log_usage
+from app.core.logger import log_event, logger
+from app.core.quota import QuotaReservation, check_quota, release_quota
+from app.core.rate_limiter import RateLimitResult, check_rate_limit
+from app.middleware.request_id import RequestIDMiddleware
+from app.proxy.forwarder import close_proxy_client, is_known_service
 from app.proxy.retry import forward_with_resilience
 
-# Phase 4: Observability
-from app.core.background_logging import log_usage, log_audit
+settings = get_settings()
 
-app = FastAPI(title="Multi-Tenant API Gateway")
 
-# Register the Request ID middleware
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    await close_proxy_client()
+    await redis_store.close_redis()
+
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+if settings.cors_origins:
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+# Added last so it is the outermost user middleware and still sees CORS
+# preflight responses.
 app.add_middleware(RequestIDMiddleware)
 
-# --- GLOBAL EXCEPTION HANDLER ---
-@app.exception_handler(HTTPException)
-async def global_http_exception_handler(request: Request, exc: HTTPException):
-    """
-    Intercepts ALL HTTPExceptions (including 401s from dependencies) before 
-    they are returned to the client, ensuring audit logs are always written.
-    """
-    tasks = BackgroundTasks()
-    request_id = getattr(request.state, "request_id", "unknown")
-    
-    # Safely extract the tenant ID if they made it past authentication
-    tenant_id = "unknown"
-    if hasattr(request.state, "tenant"):
-        tenant_id = request.state.tenant.get("tenant_id", "unknown")
-        
-    # Attach the audit log task to the error response
-    tasks.add_task(
-        log_audit, 
-        event="request_blocked_or_failed", 
-        request_id=request_id, 
-        reason=exc.detail, 
-        tenant_id=tenant_id
-    )
-    
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-        background=tasks
-    )
 
-# --- GATEWAY ROUTE ---
-@app.api_route("/api/v1/{service}/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
-async def gateway(
-    service: str, 
-    path: str, 
+def _request_id(request: Request) -> str:
+    return getattr(request.state, "request_id", "unknown")
+
+
+def _tenant_id(request: Request) -> str:
+    tenant = getattr(request.state, "tenant", None)
+    if tenant:
+        return tenant.get("tenant_id", "unknown")
+    return "unknown"
+
+
+def _audit_tasks(
     request: Request,
-    background_tasks: BackgroundTasks,
-    tenant: dict = Depends(authenticate_tenant)
+    *,
+    event: str,
+    reason: str,
+    status_code: int,
+) -> BackgroundTasks:
+    tasks = BackgroundTasks()
+    tasks.add_task(
+        log_audit,
+        event=event,
+        request_id=_request_id(request),
+        reason=reason,
+        tenant_id=_tenant_id(request),
+        method=request.method,
+        path=request.url.path,
+        status_code=status_code,
+    )
+    return tasks
+
+
+@app.exception_handler(StarletteHTTPException)
+async def global_http_exception_handler(
+    request: Request,
+    exc: StarletteHTTPException,
 ):
     """
-    Catch-all route. Error handling is now delegated to the global exception handler.
+    Convert every HTTP error into a consistent response and always emit an
+    audit log, including errors raised inside auth dependencies.
     """
-    start = time.time()
-    request_id = getattr(request.state, "request_id", "unknown")
-    
-    # 1. Edge Security & Tier Limits 
-    await check_quota(tenant)
-    await check_rate_limit(tenant)
-    
-    # 2. Resilient Proxy Handoff
-    proxied = await forward_with_resilience(service, path, request)
-    
-    # 3. Fire-and-forget telemetry for SUCCESSFUL requests
-    latency_ms = (time.time() - start) * 1000
-    background_tasks.add_task(
-        log_usage, 
-        tenant_id=tenant["tenant_id"], 
-        path=f"/{service}/{path}", 
-        status_code=proxied.status_code, 
-        latency_ms=latency_ms, 
-        request_id=request_id
+    tasks = _audit_tasks(
+        request,
+        event="request_blocked_or_failed",
+        reason=str(exc.detail),
+        status_code=exc.status_code,
     )
-    
+    response = JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "request_id": _request_id(request)},
+        background=tasks,
+    )
+    response.headers["X-Request-ID"] = _request_id(request)
+    if exc.headers:
+        response.headers.update(exc.headers)
+    return response
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """
+    Return a generic 500 without leaking internals, but keep a full traceback
+    in the server log and an audit record for the tenant.
+    """
+    logger.exception("Unhandled gateway exception", exc_info=exc)
+    metrics.inc("gateway_requests_failed_total")
+    tasks = _audit_tasks(
+        request,
+        event="request_unhandled_error",
+        reason=type(exc).__name__,
+        status_code=500,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "request_id": _request_id(request)},
+        headers={"X-Request-ID": _request_id(request)},
+        background=tasks,
+    )
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready():
+    try:
+        await redis_store.redis_client.ping()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis unavailable",
+        ) from exc
+    return {"status": "ready"}
+
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    return PlainTextResponse(
+        metrics.render_prometheus(),
+        media_type="text/plain; version=0.0.4",
+    )
+
+
+def _apply_metering_headers(
+    response,
+    rate_limit: RateLimitResult,
+    quota: QuotaReservation | None,
+) -> None:
+    for key, value in rate_limit.headers().items():
+        response.headers[key] = value
+    if quota is not None:
+        for key, value in quota.headers().items():
+            response.headers[key] = value
+
+
+async def _safe_release(
+    reservation: QuotaReservation,
+    request_id: str,
+    tenant_id: str,
+) -> None:
+    try:
+        await release_quota(reservation)
+        metrics.inc("gateway_quota_refunds_total")
+    except Exception as exc:
+        # A failed refund must never mask the original request failure.
+        log_event(
+            "quota_release_failed",
+            request_id=request_id,
+            tenant_id=tenant_id,
+            reason=type(exc).__name__,
+        )
+
+
+@app.api_route(
+    "/api/v1/{service}/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    include_in_schema=False,
+)
+async def gateway(
+    service: str,
+    path: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    tenant: dict = Depends(authenticate_tenant),  # noqa: B008
+):
+    """
+    Catch-all gateway route.
+
+    Order matters:
+      1. Reject unknown services before consuming any metered budget.
+      2. Rate limit (cheap, per-minute) before quota (monthly billing).
+      3. Reserve quota, then refund it if the request is not billable.
+    """
+    start = time.perf_counter()
+    request_id = _request_id(request)
+
+    if not is_known_service(service):
+        raise HTTPException(status_code=404, detail="Unknown service")
+
+    rate_limit = await check_rate_limit(tenant)
+
+    try:
+        reservation = await check_quota(tenant)
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), **rate_limit.headers()}
+        raise
+
+    try:
+        proxied = await forward_with_resilience(service, path, request)
+    except HTTPException as exc:
+        await _safe_release(reservation, request_id, tenant["tenant_id"])
+        exc.headers = {**(exc.headers or {}), **rate_limit.headers()}
+        raise
+    except Exception:
+        await _safe_release(reservation, request_id, tenant["tenant_id"])
+        raise
+
+    if proxied.status_code >= 400:
+        await _safe_release(reservation, request_id, tenant["tenant_id"])
+        _apply_metering_headers(proxied, rate_limit, None)
+    else:
+        _apply_metering_headers(proxied, rate_limit, reservation)
+
+    latency_ms = (time.perf_counter() - start) * 1000
+    background_tasks.add_task(
+        log_usage,
+        tenant_id=tenant["tenant_id"],
+        path=f"/{service}/{path}",
+        status_code=proxied.status_code,
+        latency_ms=latency_ms,
+        request_id=request_id,
+    )
+    proxied.background = background_tasks
+
     return proxied

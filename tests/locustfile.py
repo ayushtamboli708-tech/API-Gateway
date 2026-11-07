@@ -1,4 +1,5 @@
-from locust import HttpUser, task, between
+from locust import HttpUser, between, task
+
 
 class GatewayUser(HttpUser):
     # Reduced wait time to push more concurrent requests

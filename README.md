@@ -25,13 +25,14 @@ This project explores how those mechanisms — the same ones found in tools like
 |---|---|
 | 🔑 **API Key Authentication** | Resolves `X-API-Key` to a tenant profile via Redis |
 | 🏢 **Multi-Tenancy** | Tenant metadata (plan, quota, limits) isolated in Redis Hashes |
-| 📊 **Quota Management** | Atomic monthly usage tracking (`HINCRBY`), returns `403` on breach |
+| 📊 **Quota Management** | Atomic check-and-reserve monthly usage (Lua), refunds non-billable requests, returns `403` on breach |
 | 🚦 **Rate Limiting** | Sliding-window limiter in Redis, returns `429` on burst traffic |
 | 🔄 **Reverse Proxy** | Async reverse proxy via HTTPX with configurable connect/read timeouts |
 | 🔁 **Idempotent Retries** | Exponential backoff, restricted to safe methods (GET/HEAD/OPTIONS) |
 | ⚡ **Circuit Breaker** | Closed → Open → Half-Open state machine to fail fast on downstream outages |
 | 🔍 **Distributed Tracing** | `X-Request-ID` generated/propagated across all logs |
 | 🧾 **Structured Logging** | Async, zero-latency usage + security audit logs via `BackgroundTasks` |
+| 📈 **Metrics** | Prometheus text endpoint with counters, uptime, and breaker state |
 
 ---
 
@@ -47,10 +48,10 @@ Client
 [Auth Layer] → API Key → Tenant lookup (Redis)
   │
   ▼
-[Quota Check] → monthly usage (Redis, atomic)
+[Rate Limiter] → sliding window (Redis, rejected requests are not counted)
   │
   ▼
-[Rate Limiter] → sliding window (Redis)
+[Quota Check] → monthly usage (Redis Lua, reserve + refund)
   │
   ▼
 [Circuit Breaker] → fail fast if downstream is OPEN
@@ -62,7 +63,7 @@ Client
 [Background Tasks] → usage analytics + audit logging
   │
   ▼
-Response (200 / 403 / 429 / 503 / 504)
+Response (200 / 401 / 403 / 404 / 413 / 429 / 500 / 502 / 503 / 504)
 ```
 
 ---
@@ -91,6 +92,7 @@ api-gateway/
 │   │   ├── rate_limiter.py         # Sliding-window rate limiting
 │   │   ├── circuit_breaker.py      # Breaker state machine
 │   │   ├── logger.py               # Structured JSON logger
+│   │   ├── metrics.py              # Prometheus counters + breaker gauges
 │   │   └── background_logging.py  # Usage + audit log tasks
 │   ├── middleware/
 │   │   └── request_id.py           # X-Request-ID injection
@@ -99,14 +101,21 @@ api-gateway/
 │   │   └── retry.py                # Retry + backoff + breaker integration
 │   └── config.py                   # Environment-driven settings
 ├── scripts/
-│   └── seed_tenants.py             # Redis tenant seeding script
+│   ├── seed_tenants.py             # Development tenant seeding
+│   └── seed_loadtest.py            # High-limit tenant for Locust
 ├── tests/
+│   ├── conftest.py                 # Fake Redis + breaker fixtures
 │   ├── locustfile.py               # Load testing
 │   └── test_gateway.py             # Unit/integration tests
-├── .env
+├── .env.example
+├── .github/workflows/ci.yml       # Test CI
 ├── .gitignore
+├── Dockerfile
+├── .dockerignore
 ├── requirements.txt
+├── requirements-dev.txt
 ├── docker-compose.yml
+├── LICENSE
 └── README.md
 ```
 
@@ -128,25 +137,65 @@ python -m venv venv
 source venv/bin/activate      # Windows: venv\Scripts\activate
 
 pip install -r requirements.txt
+
+# For tests and load testing:
+pip install -r requirements-dev.txt
 ```
 
 ### Run Redis
 
 ```bash
-docker run -d --name gateway-redis -p 6379:6379 redis:7-alpine
+docker compose up -d redis
 ```
 
 ### Seed Tenant Data
 
 ```bash
-python scripts/seed_tenants.py
+python -m scripts.seed_tenants
+# or: python scripts/seed_tenants.py
 ```
+
+### Configuration
+
+All settings are environment-driven and use the `GATEWAY_` prefix. Copy
+`.env.example` to `.env` and adjust:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GATEWAY_REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
+| `GATEWAY_BACKENDS` | `{"users":"http://localhost:9001","orders":"http://localhost:9002"}` | Service routing table |
+| `GATEWAY_PROXY_TOTAL_TIMEOUT` | `10.0` | Hard deadline per client request, including retries |
+| `GATEWAY_MAX_REQUEST_BODY_BYTES` | `10485760` | Maximum buffered request body (10 MiB) |
+| `GATEWAY_RETRY_MAX_ATTEMPTS` | `2` | Retries for idempotent methods |
+| `GATEWAY_BREAKER_FAILURE_THRESHOLD` | `5` | Failures before the circuit opens |
+| `GATEWAY_BREAKER_RECOVERY_TIMEOUT` | `30.0` | Seconds before a half-open probe |
+| `GATEWAY_CORS_ORIGINS` | `[]` | JSON array; empty disables CORS |
 
 ### Run the Gateway
 
 ```bash
 uvicorn app.main:app --reload --port 8000
 ```
+
+### Run demo downstream services
+
+The gateway routes `users` to port `9001` and `orders` to `9002` by default.
+Start the bundled demo backend twice:
+
+```bash
+uvicorn app.backend:app --port 9001
+uvicorn app.backend:app --port 9002
+```
+
+### Run everything with Docker
+
+```bash
+docker compose up -d --build
+docker compose exec gateway python -m scripts.seed_tenants
+```
+
+The compose file points `host.docker.internal` at the host, so run the demo
+backends on the host as shown above (or override `GATEWAY_BACKENDS`).
 
 ### Test a Request
 
@@ -155,27 +204,52 @@ curl -i http://localhost:8000/api/v1/users/test \
   -H "X-API-Key: key-abc123"
 ```
 
+### Run the tests
+
+```bash
+pytest
+ruff check app tests scripts
+```
+
 ---
 
 ## 🖼️ Screenshots
 
-### Architecture
-![Architecture](pictures\architecture.png)
+### 🏗️ Architecture
 
-### Locust Load Test
-![Locust Results](pictures\locus-stats.png)
-![Locust Charts](pictures\locus-charts.png)
-
-### Structured Logs
-**Usage log (successful request):**
-![Usage Log](pictures\successfull.png)
-![Usage Log](pictures\success-terminal.png)
-
-**Audit log (blocked request — missing API key):**
-![Audit Log](pictures\unsuccessfull.png)
-![Audit Log](pictures\unsuccess-terminal.png)
+![Architecture](pictures/architecture.png)
 
 ---
+
+### 📈 Locust Load Test
+
+**Statistics**
+
+![Locust Results](pictures/locus-stats.png)
+
+**Performance Charts**
+
+![Locust Charts](pictures/locus-charts.png)
+
+---
+
+### ✅ Successful Request
+
+![Successful Request](pictures/successfull.png)
+
+**Structured Usage Log**
+
+![Usage Log](pictures/success-terminal.png)
+
+---
+
+### ❌ Unauthorized Request
+
+![Unauthorized Request](pictures/unsuccessfull.png)
+
+**Structured Audit Log**
+
+![Audit Log](pictures/unsuccess-terminal.png)
 
 ## ⚡ Performance
 
@@ -199,10 +273,40 @@ curl -i http://localhost:8000/api/v1/users/test \
 
 ---
 
+## 🧪 Testing
+
+```bash
+pytest
+```
+
+The suite uses `fakeredis` (with Lua support via `lupa`) and covers:
+
+- rejected requests do not grow the rate-limit window
+- quota reservations are capped and refunded for non-billable responses
+- HALF_OPEN allows only one probe
+- backend 5xx responses open the circuit
+- 502/504 retries are limited to idempotent methods
+- the gateway strips `X-API-Key` before proxying
+- compressed response bodies are decoded without leaving `Content-Encoding`
+- unknown services are rejected before consuming rate limit/quota
+- auth failures return `401`
+- `X-Request-ID` is validated and echoed
+
+---
+
+## 📈 Observability
+
+- `GET /health` — liveness probe
+- `GET /ready` — readiness probe (pings Redis)
+- `GET /metrics` — Prometheus text exposition with request, failure, rate-limit, quota, retry, circuit-breaker, and uptime metrics
+
+All request logs are JSON lines containing `request_id`, `tenant_id`, `method`, `path`, and `status_code` where available.
+
+---
+
 ## 🧪 Load Testing
 
 ```bash
-pip install locust
 locust -f tests/locustfile.py --host=http://localhost:8000
 ```
 
@@ -217,21 +321,29 @@ Open `http://localhost:8089` to configure concurrent users and monitor latency, 
 | Missing/invalid API key | `401 Unauthorized` |
 | Monthly quota exceeded | `403 Forbidden` |
 | Rate limit exceeded | `429 Too Many Requests` |
+| Unknown service | `404 Not Found` |
 | Downstream circuit open | `503 Service Unavailable` |
+| Redis unavailable | `503 Service Unavailable` |
+| Backend connection failure | `502 Bad Gateway` |
 | Downstream timeout after retries | `504 Gateway Timeout` |
+| Request body too large | `413 Payload Too Large` |
 | Successful proxy | `200 OK` (+ backend response) |
 
-Every response includes an `X-Request-ID` header for tracing across services.
+Every response includes an `X-Request-ID` header. Successful responses also
+include `X-RateLimit-*` and (when billable) `X-Quota-*` headers; `429`/`503`
+responses include `Retry-After` where applicable.
 
 ---
 
 ## ⚠️ Known Limitations & Future Work
 
-- **Redis is a single point of failure** for tenant lookup, quotas, and rate limiting — fail-open vs. fail-closed behavior is not yet enforced.
+- **Redis is a single point of failure** for tenant lookup, quotas, and rate limiting. Failures currently fail closed with `503`; a configurable fail-open mode is not implemented.
 - **Circuit breaker state is in-memory per process** — running multiple gateway instances requires moving this into Redis, or explicitly accepting independent per-instance tripping.
-- **API key auth has no rotation, hashing, or revocation** — acceptable for this project's scope, flagged for future hardening.
+- **Request bodies are buffered in memory** up to `GATEWAY_MAX_REQUEST_BODY_BYTES` (10 MiB by default); responses are streamed back to the client. Streaming request uploads is future work.
+- **API key auth has no rotation, hashing, or revocation** — keys are stored in plaintext Redis keys.
 - **Tenant onboarding is manual** via `scripts/seed_tenants.py` — no admin API yet.
 - **No Redis Cluster/Sentinel** — sufficient for local/single-instance use, not for horizontal scaling.
+- **Metrics are in-process counters** — they reset on restart and are not aggregated across gateway instances.
 
 ---
 

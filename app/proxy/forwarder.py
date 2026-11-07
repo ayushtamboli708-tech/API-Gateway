@@ -1,75 +1,196 @@
 import httpx
-from fastapi import Request, Response, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import HTTPException, Request, Response
+from starlette.responses import StreamingResponse
 
-# Registry for downstream microservices
-# (We will eventually move this to app/config.py as discussed)
-BACKEND_MAP = {
-    "users": "http://localhost:9001",
-    "orders": "http://localhost:9002",
+from app.config import get_settings
+
+_settings = get_settings()
+
+# Hop-by-hop headers are meaningful for a single transport connection and must
+# not be forwarded by a proxy (RFC 7230 section 6.1).
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
 }
 
-# Headers from the backend that the gateway should NOT pass to the client
-EXCLUDED_HEADERS = {
-    "server", 
-    "date", 
-    "content-length", 
-    "transfer-encoding", 
-    "connection"
+# The API key belongs to the gateway -> client relationship. It must never be
+# forwarded to a downstream service.
+REQUEST_HEADERS_EXCLUDED = HOP_BY_HOP_HEADERS | {
+    "host",
+    "x-api-key",
+    "content-length",
 }
 
-# PHASE 3: Strict Timeouts
-# connect: max time to establish a socket connection (2s)
-# read: max time to wait for a chunk of data (3s)
-# write: max time to send data (2s)
-# pool: max time to wait for an available connection from the pool (2s)
-TIMEOUT = httpx.Timeout(connect=2.0, read=3.0, write=2.0, pool=2.0)
+# We stream decoded bytes (`aiter_bytes`), so `content-encoding` no longer
+# describes the bytes we send back. `content-length` is recalculated by the
+# server when the response is chunked.
+RESPONSE_HEADERS_EXCLUDED = HOP_BY_HOP_HEADERS | {
+    "server",
+    "date",
+    "content-length",
+    "content-encoding",
+}
 
-# --- THE FIX: Initialize a single, global AsyncClient ---
-# This keeps TCP connections alive and reuses them across requests.
-proxy_client = httpx.AsyncClient(timeout=TIMEOUT)
+TIMEOUT = httpx.Timeout(
+    connect=_settings.proxy_connect_timeout,
+    read=_settings.proxy_read_timeout,
+    write=_settings.proxy_write_timeout,
+    pool=_settings.proxy_pool_timeout,
+)
+
+proxy_client = httpx.AsyncClient(
+    timeout=TIMEOUT,
+    limits=httpx.Limits(
+        max_connections=_settings.proxy_max_connections,
+        max_keepalive_connections=_settings.proxy_max_keepalive_connections,
+    ),
+    follow_redirects=False,
+)
+
+
+def is_known_service(service: str) -> bool:
+    return service in _settings.backends
+
+
+async def close_proxy_client() -> None:
+    """Close the shared HTTPX connection pool. Called from the lifespan."""
+    await proxy_client.aclose()
+
+
+def _request_headers(request: Request) -> dict[str, str]:
+    # HTTP header names are case-insensitive. Normalise them so the values we
+    # set below replace (rather than duplicate) client-supplied headers such
+    # as X-Request-ID.
+    headers = {
+        key.lower(): value
+        for key, value in request.headers.items()
+        if key.lower() not in REQUEST_HEADERS_EXCLUDED
+    }
+
+    request_id = getattr(request.state, "request_id", None)
+    if request_id:
+        headers["x-request-id"] = request_id
+
+    tenant = getattr(request.state, "tenant", None)
+    if tenant and tenant.get("tenant_id"):
+        headers["x-tenant-id"] = tenant["tenant_id"]
+
+    # At the edge we do not trust a client-supplied X-Forwarded-For value;
+    # otherwise any client could spoof its source address.
+    client_ip = request.client.host if request.client else None
+    if client_ip:
+        headers["x-forwarded-for"] = client_ip
+
+    headers["x-forwarded-proto"] = request.url.scheme
+    original_host = request.headers.get("host")
+    if original_host:
+        headers["x-forwarded-host"] = original_host
+
+    return headers
+
+
+async def _read_request_body(request: Request) -> bytes:
+    """
+    Read and cache the request body, enforcing a hard size limit.
+
+    The cache is required because retries reuse the same Request object and the
+    ASGI receive stream can only be consumed once.
+    """
+    cached = getattr(request.state, "_gateway_body", None)
+    if cached is not None:
+        return cached
+
+    limit = _settings.max_request_body_bytes
+    declared_length = request.headers.get("content-length")
+    if declared_length is not None:
+        try:
+            if int(declared_length) > limit:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Request body too large",
+                )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Content-Length header",
+            ) from exc
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail="Request body too large",
+            )
+        chunks.append(chunk)
+
+    body = b"".join(chunks)
+    request.state._gateway_body = body
+    return body
+
 
 async def forward_request(service: str, path: str, request: Request) -> Response:
     """
-    Takes an incoming request, applies timeouts, injects tracing IDs,
-    and proxies it to the designated backend service.
+    Proxy one request downstream, applying timeouts and sanitising headers.
+
+    The upstream response body is streamed back to the client instead of being
+    buffered in gateway memory.
     """
-    if service not in BACKEND_MAP:
-        return JSONResponse(status_code=404, content={"error": "Unknown service"})
+    if service not in _settings.backends:
+        raise HTTPException(status_code=404, detail="Unknown service")
 
-    target_url = f"{BACKEND_MAP[service]}/{path}"
-    
-    # 1. Strip the 'host' header to avoid confusing downstream servers
-    headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
-    
-    # 2. Inject the Request ID generated by the middleware
-    if hasattr(request.state, "request_id"):
-        headers["X-Request-ID"] = request.state.request_id
-    
-    # 3. Apply the strict TIMEOUT configuration using the global HTTPX client
-    try:
-        proxied = await proxy_client.request(
-            method=request.method,
-            url=target_url,
-            headers=headers,
-            content=await request.body(),
-            params=request.query_params,
-        )
-    except httpx.TimeoutException as e:
-        # Explicitly handle timeouts with a 504 status code
-        raise HTTPException(status_code=504, detail=f"Backend service timed out: {str(e)}")
-    except httpx.RequestError as e:
-        # Handle other connection failures (e.g., connection refused)
-        raise HTTPException(status_code=502, detail=f"Backend communication failed: {str(e)}")
+    target_url = f"{_settings.backends[service].rstrip('/')}/{path}"
+    body = await _read_request_body(request)
 
-    # 4. Clean the response headers before handing them back to FastAPI
-    clean_headers = {
-        k: v for k, v in proxied.headers.items() 
-        if k.lower() not in EXCLUDED_HEADERS
-    }
-
-    return Response(
-        content=proxied.content,
-        status_code=proxied.status_code,
-        headers=clean_headers
+    upstream_request = proxy_client.build_request(
+        method=request.method,
+        url=target_url,
+        headers=_request_headers(request),
+        content=body,
+        params=request.query_params,
     )
+
+    try:
+        proxied = await proxy_client.send(upstream_request, stream=True)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="Backend service timed out",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Backend communication failed",
+        ) from exc
+
+    async def body_iterator():
+        try:
+            async for chunk in proxied.aiter_bytes():
+                yield chunk
+        finally:
+            await proxied.aclose()
+
+    response = StreamingResponse(
+        body_iterator(),
+        status_code=proxied.status_code,
+    )
+
+    # Preserve duplicate headers such as Set-Cookie by writing raw headers
+    # instead of collapsing them into a dict.
+    for key, value in proxied.headers.multi_items():
+        if key.lower() in RESPONSE_HEADERS_EXCLUDED:
+            continue
+        response.raw_headers.append(
+            (key.encode("latin-1"), value.encode("latin-1"))
+        )
+
+    response.headers["Via"] = "1.1 api-gateway"
+    return response

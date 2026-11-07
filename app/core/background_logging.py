@@ -1,5 +1,6 @@
 from app.core.logger import log_event
 
+
 def log_usage(tenant_id: str, path: str, status_code: int, latency_ms: float, request_id: str):
     """
     Records API usage metrics for a specific tenant.
