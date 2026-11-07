@@ -1,6 +1,7 @@
 from functools import lru_cache
+from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,6 +39,26 @@ class Settings(BaseSettings):
         }
     )
 
+    @field_validator("backends")
+    @classmethod
+    def _validate_backends(cls, value: dict[str, str]) -> dict[str, str]:
+        """Reject backend URLs that could be used for SSRF or credential leaks."""
+        for name, url in value.items():
+            parts = urlsplit(url)
+            if parts.scheme not in {"http", "https"} or not parts.hostname:
+                raise ValueError(
+                    f"Backend {name!r} must be an absolute http(s) URL"
+                )
+            if parts.username or parts.password:
+                raise ValueError(
+                    f"Backend {name!r} must not embed credentials"
+                )
+            if parts.query or parts.fragment:
+                raise ValueError(
+                    f"Backend {name!r} must not include a query or fragment"
+                )
+        return value
+
     # --- Proxy timeouts -------------------------------------------------
     proxy_connect_timeout: float = 2.0
     proxy_read_timeout: float = 3.0
@@ -65,6 +86,15 @@ class Settings(BaseSettings):
     # --- Metering -------------------------------------------------------
     rate_limit_window_seconds: int = 60
     quota_ttl_seconds: int = 60 * 60 * 24 * 31
+
+    # --- Authentication abuse protection --------------------------------
+    # Invalid API keys are counted per client IP; valid traffic is never
+    # affected. 429 is returned once the limit is exceeded.
+    auth_failure_limit: int = 20
+    auth_failure_window_seconds: int = 60
+
+    # --- Host allow-list (empty/"*" disables the check) ------------------
+    allowed_hosts: list[str] = Field(default_factory=lambda: ["*"])
 
     # --- CORS (disabled by default; set GATEWAY_CORS_ORIGINS as JSON) ---
     cors_origins: list[str] = Field(default_factory=list)

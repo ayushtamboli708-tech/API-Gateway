@@ -14,6 +14,8 @@ from app.core.logger import log_event, logger
 from app.core.quota import QuotaReservation, check_quota, release_quota
 from app.core.rate_limiter import RateLimitResult, check_rate_limit
 from app.middleware.request_id import RequestIDMiddleware
+from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.models import ErrorResponse, HealthResponse, ReadyResponse
 from app.proxy.forwarder import close_proxy_client, is_known_service
 from app.proxy.retry import forward_with_resilience
 
@@ -27,7 +29,16 @@ async def lifespan(_: FastAPI):
     await redis_store.close_redis()
 
 
-app = FastAPI(title=settings.app_name, lifespan=lifespan)
+app = FastAPI(
+    title=settings.app_name,
+    version="1.1.0",
+    description=(
+        "Multi-tenant API gateway with API-key auth, Redis-backed rate "
+        "limiting and quotas, resilient reverse proxying, and Prometheus "
+        "metrics."
+    ),
+    lifespan=lifespan,
+)
 
 if settings.cors_origins:
     from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +48,18 @@ if settings.cors_origins:
         allow_origins=settings.cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Reject requests with an unexpected Host header when an allow-list is set.
+# This mitigates host-header injection and DNS-rebinding style attacks.
+if settings.allowed_hosts and "*" not in settings.allowed_hosts:
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=settings.allowed_hosts,
     )
 
 # Added last so it is the outermost user middleware and still sees CORS
@@ -124,12 +147,12 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health():
     return {"status": "ok"}
 
 
-@app.get("/ready")
+@app.get("/ready", response_model=ReadyResponse)
 async def ready():
     try:
         await redis_store.redis_client.ping()
@@ -183,6 +206,16 @@ async def _safe_release(
     "/api/v1/{service}/{path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
     include_in_schema=False,
+    responses={
+        401: {"model": ErrorResponse, "description": "Missing or invalid API key"},
+        403: {"model": ErrorResponse, "description": "Monthly quota exceeded"},
+        404: {"model": ErrorResponse, "description": "Unknown service"},
+        413: {"model": ErrorResponse, "description": "Request body too large"},
+        429: {"model": ErrorResponse, "description": "Rate limit or auth failure limit"},
+        502: {"model": ErrorResponse, "description": "Backend connection failure"},
+        503: {"model": ErrorResponse, "description": "Circuit open or Redis unavailable"},
+        504: {"model": ErrorResponse, "description": "Backend timeout"},
+    },
 )
 async def gateway(
     service: str,

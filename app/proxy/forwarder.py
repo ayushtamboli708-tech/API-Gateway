@@ -1,3 +1,5 @@
+from urllib.parse import urljoin, urlsplit
+
 import httpx
 from fastapi import HTTPException, Request, Response
 from starlette.responses import StreamingResponse
@@ -61,6 +63,45 @@ def is_known_service(service: str) -> bool:
 async def close_proxy_client() -> None:
     """Close the shared HTTPX connection pool. Called from the lifespan."""
     await proxy_client.aclose()
+
+
+def _default_port(scheme: str) -> int:
+    return 443 if scheme == "https" else 80
+
+
+def _target_url(service: str, path: str) -> str:
+    """
+    Build the upstream URL while preventing SSRF and path-prefix escapes.
+
+    `urljoin` resolves `../` segments and absolute URLs. We then verify that
+    the resulting scheme/host/port still match the configured backend, and
+    that the resolved path cannot escape a configured base path.
+    """
+    if "\\" in path or "%2e" in path.lower() or "\x00" in path:
+        raise HTTPException(status_code=400, detail="Invalid request path")
+
+    base = _settings.backends[service]
+    base_parts = urlsplit(base)
+    target = urljoin(base.rstrip("/") + "/", path.lstrip("/"))
+    target_parts = urlsplit(target)
+
+    same_origin = (
+        target_parts.scheme == base_parts.scheme
+        and target_parts.hostname == base_parts.hostname
+        and (target_parts.port or _default_port(target_parts.scheme))
+        == (base_parts.port or _default_port(base_parts.scheme))
+    )
+    if not same_origin:
+        raise HTTPException(status_code=400, detail="Invalid request path")
+
+    base_path = base_parts.path.rstrip("/")
+    if base_path and not (
+        target_parts.path == base_path
+        or target_parts.path.startswith(base_path + "/")
+    ):
+        raise HTTPException(status_code=400, detail="Invalid request path")
+
+    return target
 
 
 def _request_headers(request: Request) -> dict[str, str]:
@@ -147,7 +188,7 @@ async def forward_request(service: str, path: str, request: Request) -> Response
     if service not in _settings.backends:
         raise HTTPException(status_code=404, detail="Unknown service")
 
-    target_url = f"{_settings.backends[service].rstrip('/')}/{path}"
+    target_url = _target_url(service, path)
     body = await _read_request_body(request)
 
     upstream_request = proxy_client.build_request(

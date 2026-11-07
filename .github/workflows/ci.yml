@@ -23,3 +23,6 @@ jobs:
 
       - name: Lint
         run: ruff check app tests scripts
+
+      - name: Audit runtime dependencies
+        run: pip-audit -r requirements.txt

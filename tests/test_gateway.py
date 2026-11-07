@@ -466,3 +466,109 @@ def test_metrics_endpoint_exposes_prometheus_text(fake_redis):
     assert "gateway_requests_total" in response.text
     assert "gateway_uptime_seconds" in response.text
     assert "gateway_breaker_state" in response.text
+
+
+# ---------------------------------------------------------------------------
+# Security hardening
+# ---------------------------------------------------------------------------
+
+
+def test_security_headers_are_added(fake_redis):
+    from app import main as main_module
+
+    client = TestClient(main_module.app)
+
+    response = client.get("/health")
+
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
+    assert response.headers["Referrer-Policy"] == "no-referrer"
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_invalid_credentials_are_throttled_per_ip(fake_redis, monkeypatch):
+    from app import main as main_module
+
+    monkeypatch.setattr(main_module.settings, "auth_failure_limit", 2)
+    monkeypatch.setattr(main_module.settings, "auth_failure_window_seconds", 60)
+
+    client = TestClient(main_module.app)
+    headers = {"X-API-Key": "wrong-key"}
+
+    assert client.get("/api/v1/users/test", headers=headers).status_code == 401
+    assert client.get("/api/v1/users/test", headers=headers).status_code == 401
+
+    throttled = client.get("/api/v1/users/test", headers=headers)
+    assert throttled.status_code == 429
+    assert throttled.json()["detail"] == "Too many authentication failures"
+    assert int(throttled.headers["Retry-After"]) >= 1
+
+
+def test_successful_auth_clears_failure_budget(fake_redis, monkeypatch):
+    from app import main as main_module
+
+    monkeypatch.setattr(main_module.settings, "auth_failure_limit", 1)
+
+    run(seed_tenant(fake_redis))
+    client = TestClient(main_module.app)
+
+    assert (
+        client.get(
+            "/api/v1/users/test", headers={"X-API-Key": "wrong-key"}
+        ).status_code
+        == 401
+    )
+
+    # A valid key resets the per-IP failure counter...
+    assert (
+        client.get("/api/v1/users/test", headers={"X-API-Key": API_KEY}).status_code
+        == 200
+    )
+
+    # ...so the next bad attempt is a 401 again, not a 429.
+    assert (
+        client.get(
+            "/api/v1/users/test", headers={"X-API-Key": "wrong-key"}
+        ).status_code
+        == 401
+    )
+
+
+def test_proxy_rejects_absolute_urls_and_backslashes():
+    for path in (
+        "https://evil.example/steal",
+        "..\\..\\admin",
+    ):
+        with pytest.raises(HTTPException) as exc:
+            forwarder._target_url("users", path)
+        assert exc.value.status_code == 400
+
+
+def test_proxy_rejects_path_prefix_escape(monkeypatch):
+    monkeypatch.setitem(
+        forwarder._settings.backends,
+        "users",
+        "http://localhost:9001/api",
+    )
+
+    assert (
+        forwarder._target_url("users", "users/test")
+        == "http://localhost:9001/api/users/test"
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        forwarder._target_url("users", "../admin")
+    assert exc.value.status_code == 400
+
+
+def test_backend_urls_are_validated():
+    from pydantic import ValidationError
+
+    from app.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(backends={"users": "ftp://localhost:9001"})
+
+    with pytest.raises(ValidationError):
+        Settings(backends={"users": "http://user:pass@localhost:9001"})
+
